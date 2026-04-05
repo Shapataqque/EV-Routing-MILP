@@ -14,7 +14,7 @@ This repository contains the MATLAB code and input datasets used in the manuscri
 - intlinprog
 
 ## Main file
-- `code/ev_routing_milp_time_dependent_v5.m`
+- `code/ev_routing_milp_time_dependent_v6.m`
 
 ## Data files
 - `data/Analiz_Sonuclari_Final.xlsx`
