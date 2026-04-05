@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+message: "If you use this code and dataset, please cite it as follows."
+title: "EV Routing MILP :contentReference[oaicite:17]{index=17}ftware
+authors:
+  - family-names: "Ozdemir"
+    given-names: "Adil"
+repository-code: "https://github.com/KULLANICI_ADIN/ev-routing-milp-time-dependent"
+version: "v1.0.0"
+date-released: 2026-04-05
+abstract: "MATLAB code and input data for EV routing and charging optimization under dynamic pricing and HVAC-sensitive energy consumption."
