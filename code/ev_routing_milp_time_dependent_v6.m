@@ -7,14 +7,16 @@ clear; clc; close all;
 % ------------------------------------------------------------------------------
 % SECTION 1: DATA LOADING & PRE-PROCESSING
 % ------------------------------------------------------------------------------
-data_real = my_test_data_15_node_24_tslots_Ankara_Antalya();                % Real-time, dynamically changes with the start of program
-data_real.name = 'Real-time Data';                                          % Naming data                      
+%data_real = my_test_data_15_node_24_tslots_Ankara_Antalya();                % Real-time, dynamically changes with the start of program
+%data_real.name = 'Real-time Data';                                          % Naming data                      
 data_fixed = my_fixed_data_with_same_nodes();                               % Fixed (historical) data, dated 15-07-2025
-data_fixed.name = 'Fixed Data';                                             % Naming data
-dataset_list = {data_real, data_fixed};                                     % Stores datasets in an array
+data_fixed.name = 'Fixed Summer Data';                                      % Naming data
+data_winter = my_winter_data_with_same_nodes();
+data_winter.name = 'Fixed Winter Data';
+dataset_list = {data_fixed, data_winter};                                   % Stores datasets in an array, data_real removed
 results_list = cell(1, 2);                                                  % Preallocate results storage
 
-for run_idx= 1:2                                                            % Loop dataset
+for run_idx= 1:numel(dataset_list)                                          % Loop dataset
     data = dataset_list{run_idx};
     
     fprintf('\n======================================================\n');
@@ -135,8 +137,12 @@ for run_idx= 1:2                                                            % Lo
     
     results_list{run_idx} = res_struct;
 end
+% Make the winter dataset and local solver available to the
+% separate temperature-sensitivity script
+temperature_reference_data = data_winter;
+temperature_solver = @solve_ev_routing_milp;
 % ------------------------------------------------------------------------------
-% SECTION 5: VISUALIZATION DASHBOARD
+% SECTION 6: VISUALIZATION DASHBOARD
 % ------------------------------------------------------------------------------
 % Create the multi-tab interactive figure to analyze the results.
 % Calculations are complete. Now opening the window to select which result to view.
@@ -478,9 +484,43 @@ function solution = solve_ev_routing_milp(data, mode)
     % --------------------------------------------------------------------------
     % SOLVE & EXTRACT
     % --------------------------------------------------------------------------
-    opts = sdpsettings('solver','intlinprog','verbose',0, 'cachesolvers', 1);
-    sol  = optimize(constraints, objective, opts);
-    
+    opts = sdpsettings('solver','intlinprog','verbose',0, 'cachesolvers', 1, 'savesolveroutput', 1);
+    memory_before_MB = NaN;
+    memory_after_MB  = NaN;
+    memory_change_MB = NaN;
+    % Measure MATLAB process memory before optimization
+    try
+        memory_before = memory;
+
+        memory_before_MB = ...
+            memory_before.MemUsedMATLAB / 1024^2;
+    catch
+        % memory() may not be supported on every operating system
+    end
+
+    % Measure complete optimize() execution time
+    total_timer = tic;
+
+    sol = optimize( ...
+        constraints, ...
+        objective, ...
+        opts);
+
+    total_solve_time_s = toc(total_timer);
+
+    % Measure MATLAB process memory after optimization
+    try
+        memory_after = memory;
+
+        memory_after_MB = ...
+            memory_after.MemUsedMATLAB / 1024^2;
+
+        memory_change_MB = ...
+            memory_after_MB - memory_before_MB;
+    catch
+        % Keep memory values as NaN if measurement is unavailable
+    end
+
     if sol.problem == 0
         disp(['Solver (' char(mode) '): Optimal Solution Found.']);
     else
@@ -509,6 +549,50 @@ function solution = solve_ev_routing_milp(data, mode)
     solution.total_dist   = value(dist_term);
     
     solution.mode = mode;
+    solution.problem = sol.problem;
+    solution.info = sol.info;
+
+    % Computational performance metrics
+    solution.yalmip_time_s = sol.yalmiptime;
+    solution.solver_time_s = sol.solvertime;
+    solution.total_solve_time_s = total_solve_time_s;
+
+    % MATLAB process memory metrics
+    solution.memory_before_MB = memory_before_MB;
+    solution.memory_after_MB = memory_after_MB;
+    solution.memory_change_MB = memory_change_MB;
+
+   %% Optimality gap
+    solution.relative_gap = NaN;
+    solution.absolute_gap = NaN;
+
+    if isfield(sol, 'solveroutput') && ~isempty(sol.solveroutput)
+
+        % Most common YALMIP-intlinprog structure
+        if isfield(sol.solveroutput, 'output')
+            raw_output = sol.solveroutput.output;
+
+            if isfield(raw_output, 'relativegap')
+                solution.relative_gap = raw_output.relativegap;
+            end
+
+            if isfield(raw_output, 'absolutegap')
+                solution.absolute_gap = raw_output.absolutegap;
+            end
+
+        % Fallback in case fields are stored directly
+        else
+            if isfield(sol.solveroutput, 'relativegap')
+                solution.relative_gap = sol.solveroutput.relativegap;
+            end
+
+            if isfield(sol.solveroutput, 'absolutegap')
+                solution.absolute_gap = sol.solveroutput.absolutegap;
+            end
+        end
+    end
+
+    solution.relative_gap_percent = 100 * solution.relative_gap;
 end
 %% =============================================================================
 %  HELPER: Route Extraction from Binary Matrix
@@ -854,6 +938,242 @@ function data = my_fixed_data_with_same_nodes()
     fprintf('Loading Fixed Weather from Excel (15 July 2025)...\n');
     
     weather_file = 'Fixed_Weather_Data_15July.xlsx';
+    if ~isfile(weather_file)
+        error('Weather Data File not found: %s. Please run "fetch_historical_weather_STRICT.m" first.', weather_file);
+    end
+    
+    % Read Excel
+    weather_table = readtable(weather_file, 'ReadRowNames', true);
+    % Convert to matrix (15x24)
+    NodeTemp_24h = table2array(weather_table);
+    
+    % Safety check: Matrix size & Shift
+    if size(NodeTemp_24h, 2) == 24
+        NodeTemp_24h = circshift(NodeTemp_24h, -current_hour, 2);
+        fprintf('   -> Weather Data SHIFTED by -%d hours (Start: %02d:00)\n', current_hour, current_hour);
+    else
+        warning('Weather data 24 saatlik değil, shift işlemi yapılamadı.');
+    end
+
+    % --- HVAC Parameters ---
+    data.Tset = 22;         % Set temperature [C]
+    data.T_tol = 2.0;       % Temperature tolerance 
+    data.base_kW = 0.3;    % Base hvac consumption
+    data.alpha_h = 0.12;    % DeltaT additional HVAC consumption when heating
+    data.alpha_c = 0.08;   % DeltaT additional HVAC consumption when cooling
+    data.P_max_h = 5.0;     % Max heating energy
+    data.P_max_c = 3.0;     % Max cooling energy
+    
+    orig_h = 1:24;
+    targ_slots = linspace(1, 24, data.Tslots);
+    NodeTemp_HighRes = zeros(N, data.Tslots);
+    
+    for n = 1:N
+        NodeTemp_HighRes(n, :) = interp1(orig_h, NodeTemp_24h(n, :), targ_slots, 'pchip');   
+    end
+    
+    E_dynamic = zeros(N, N, data.Tslots);
+    data.Tseg = zeros(N, N, data.Tslots); 
+    
+    for k = 1:data.Tslots
+        for i = 1:N
+            for j = 1:N
+                if A(i,j) == 1
+                    T_curr = NodeTemp_HighRes(j, k);
+                    data.Tseg(i,j,k) = T_curr;
+                    
+                    if T_curr < (data.Tset - data.T_tol)
+                        dT = (data.Tset - data.T_tol) - T_curr;
+                        P_act = min((data.alpha_h * (dT^2)) + data.base_kW, data.P_max_h);
+                    elseif T_curr > (data.Tset + data.T_tol)
+                        dT = T_curr - (data.Tset + data.T_tol);
+                        P_act = min((data.alpha_c * (dT^2)) + data.base_kW, data.P_max_c);
+                    else
+                        P_act = data.base_kW;
+                    end
+                    
+                    E_hvac = P_act * tij(i,j);
+                    E_dynamic(i,j,k) = E0_static(i,j) + E_hvac;
+                end
+            end
+        end
+    end
+    data.E_dynamic = E_dynamic; 
+    data.E = mean(E_dynamic, 3); 
+    
+    % --- 6. Battery & Grid Parameters ---
+    data.Ebat     = 80;         % Total Battery Capacity [kWh]     
+    data.SOC_min  = 0.10;       % Minimum SOC allowed 
+    data.SOC_max  = 0.95;       % Maximum SOC allowed 
+    data.SOC_init = 0.35;       % Initial SOC 
+    data.min_SOC_at_dest = 0.25;% Minimum SOC at route end
+    
+    % Charger Distribution
+    type_ultra = 180; 
+    type_fast = 60; 
+    type_slow = 22;  
+    charging_power = zeros(N, 1);
+    charging_power([2,6,7,9,12,14]) = type_fast; 
+    charging_power([3,4,5,8,13]) = type_ultra; 
+    charging_power(11) = type_slow;
+    data.P_charge_kW = charging_power;
+    
+    data.ch_breakpoint = 0.80;  
+    data.ch_slow_factor = 0.33; 
+    
+    % --------------------------------------------------------------------------
+    % 7. FIXED LMP IMPORT (STEP FUNCTION - NO SMOOTHING)
+    % --------------------------------------------------------------------------
+    fprintf('Loading Fixed PJM LMP Data...\n');
+    
+    % Simulation Start Time (Fixed)
+    data.start_hour = current_hour; 
+    fprintf('Simulation Start Time: %02d:00 (FIXED - Generated Data)\n', current_hour);
+    
+    filename_lmp = 'LMP_PJM_Data_Altered.xlsx';
+    if ~isfile(filename_lmp)
+         % Fallback if file missing
+         warning('LMP Data file not found. Using constant price.');
+         data.LMP = 0.30 * ones(N, data.Tslots);
+    else
+        try
+            opts_lmp = detectImportOptions(filename_lmp, "Sheet", "Sheet1");
+            opts_lmp.VariableNamingRule = 'preserve'; 
+            lmp_table = readtable(filename_lmp, opts_lmp);
+            
+            LMP_HighRes = zeros(N, data.Tslots);
+            orig_h_price = 0:23; 
+            targ_slots_price = linspace(0, 23.75, data.Tslots);
+            
+            for i = 1:N
+                node_rows = lmp_table(lmp_table.("Node Karşılığı") == i, :);
+                if ismember('datetime_beginning_ept', node_rows.Properties.VariableNames)
+                     node_rows = sortrows(node_rows, 'datetime_beginning_ept');
+                end
+                if ismember('datetime_beginning_ept', node_rows.Properties.VariableNames)
+                     node_rows = sortrows(node_rows, 'datetime_beginning_ept');
+                end
+                prices_24h = node_rows.("kWh format");
+                
+                if length(prices_24h) < 24
+                    prices_24h = [prices_24h; repmat(mean(prices_24h), 24-length(prices_24h), 1)];
+                elseif length(prices_24h) > 24
+                    prices_24h = prices_24h(1:24);
+                end
+                
+                % FIXED TIME SHIFT
+                prices_shifted = circshift(prices_24h, -current_hour);
+                
+                % 'previous' interpolation for Step Function
+                LMP_HighRes(i, :) = interp1(orig_h_price, prices_shifted, targ_slots_price, 'previous', 'extrap');
+            end
+            
+            data.LMP = LMP_HighRes;
+            fprintf('Fixed LMP Data aligned (Step Function) and loaded successfully.\n');
+        catch ME
+            warning('LMP read failed: %s', ME.message);
+            data.LMP = 0.30 * ones(N, data.Tslots);
+        end
+    end
+    
+    data.w_time = 1.0; 
+    data.w_ch = 3.0; 
+    data.w_cost = 5.0; 
+end
+%% =============================================================================
+%  FUNCTION: My Fixed Winter Data for Test
+%  =============================================================================
+function data = my_winter_data_with_same_nodes()
+    % --- 1. Basic Topology & Global Time Setting ---
+    current_hour = 10;   % Starting hour
+    data.start_hour = current_hour; % For dashboard
+    N = 15;
+    data.N = N;         % number of nodes
+    data.origin = 1;    % starting node
+    data.dest   = 15;   % finish node
+    
+    % Virtual coordinates for Plotting
+    data.coords = [
+        58   92; % 1. Ankara
+        45   82; % 2. Polatlı
+        63   68; % 3. Kulu
+        35   78; % 4. Sivrihisar
+        14   58; % 5. Afyon
+        32   48; % 6. Akşehir
+        52   36; % 7. Konya
+        80   48; % 8. Aksaray
+        11   46; % 9. Sandıklı
+        22   33; % 10. Eğirdir
+        39   28; % 11. Beyşehir
+        12   28; % 12. Burdur
+        40   12; % 13. Akseki
+        25   08; % 14. Serik
+        18   04  % 15. Antalya
+    ];
+    
+    % --- 2. Load Excel & Extract Real GPS ---
+    filename = 'Analiz_Sonuclari_Final.xlsx';
+    try
+        opts = detectImportOptions(filename);
+        opts.VariableNamingRule = 'preserve';
+        routeData = readtable(filename, opts);
+    catch
+        error('Error: File "%s" not found.', filename);
+    end
+    dms2dec = @(s) sum(str2double(regexp(string(s), '\d+(\.\d+)?', 'match')) .* [1, 1/60, 1/3600]); % converting coordinates
+    real_coords = zeros(N, 2);                                                                      % real coordinates for route calculation
+    
+    for k = 1:height(routeData)
+        s = routeData.Start(k); e = routeData.End(k);
+        if real_coords(s, 1) == 0
+            real_coords(s,1)=dms2dec(routeData.StartLat(k)); 
+            real_coords(s,2)=dms2dec(routeData.StartLon(k)); 
+        end
+        if real_coords(e, 1) == 0
+            real_coords(e,1)=dms2dec(routeData.EndLat(k)); 
+            real_coords(e,2)=dms2dec(routeData.EndLon(k)); 
+        end
+    end
+    
+    % --- 3. Build Static Matrices ---
+    A    = zeros(N);        % Adjacency matrix                               
+    E0_static = zeros(N);   % Only traction (physics), no HVAC
+    tij  = zeros(N);        % Travel duration between node i and j [hours]
+    dist_mat = zeros(N);
+    
+    base_rate = 0.16;       % Base traction energy consumption
+    climb_penalty = 0.006;  % Climb traction energy consumption
+    descent_bonus = 0.0035;  % Descent traction energy gain  
+    
+    for k = 1:height(routeData)
+        i = routeData.Start(k); j = routeData.End(k);
+        dist = routeData.Distance_km(k);
+        gain = routeData.TotalGain(k);
+        loss = routeData.TotalLoss(k);
+        time_min = routeData.TravelTime_min(k);
+        
+        A(i,j) = 1; 
+        dist_mat(i,j) = dist;
+        E0_static(i,j) = (dist * base_rate) + (gain * climb_penalty) - (loss * descent_bonus);
+        tij(i,j) = time_min / 60; 
+    end
+    
+    data.A    = A;          % Adjacency matrix 
+    data.tij  = tij;        % Travel duration between node i and j [hours]
+    data.E0   = E0_static;  % Base traction energy [km]
+    data.dist = dist_mat;
+    
+    % --- 4. Time Setup ---
+    data.dt_min = 15;           
+    data.dt_h   = data.dt_min / 60; 
+    data.Tslots = 96;       % 24 Hours resolution
+
+    % =====================================================================
+    % 5. FIXED WEATHER GENERATION (READ FROM EXCEL & SYNCHED TO HOUR)
+    % =====================================================================
+    fprintf('Loading Fixed Weather from Excel (15 January 2025)...\n');
+    
+    weather_file = 'Fixed_Weather_Data_15January.xlsx';
     if ~isfile(weather_file)
         error('Weather Data File not found: %s. Please run "fetch_historical_weather_STRICT.m" first.', weather_file);
     end
@@ -1462,6 +1782,87 @@ function plot_dashboard_single(parentTab, solution, data, route, titlePrefix)
     grid on;
     hold off;
 
+end
+%% =============================================================================
+%  HELPER: APPLY UNIFORM AMBIENT TEMPERATURE
+%  =============================================================================
+function data_out = apply_uniform_temperature( ...
+    data_in, target_temperature_C)
+
+    % Copy the complete input dataset
+    data_out = data_in;
+
+    N = data_in.N;
+    K = data_in.Tslots;
+
+    % Assign the same temperature to all existing arcs and time slots
+    for k = 1:K
+        for i = 1:N
+            for j = 1:N
+
+                if data_in.A(i,j) == 1
+
+                    data_out.Tseg(i,j,k) = ...
+                        target_temperature_C;
+                end
+            end
+        end
+    end
+
+    % Recalculate the time-dependent energy matrix
+    E_dynamic = zeros(N, N, K);
+
+    for k = 1:K
+        for i = 1:N
+            for j = 1:N
+
+                if data_in.A(i,j) == 1
+
+                    T_curr = target_temperature_C;
+
+                    % Heating region
+                    if T_curr < ...
+                            (data_in.Tset - data_in.T_tol)
+
+                        dT = ...
+                            (data_in.Tset - data_in.T_tol) ...
+                            - T_curr;
+
+                        P_act = min( ...
+                            data_in.alpha_h * (dT^2) ...
+                            + data_in.base_kW, ...
+                            data_in.P_max_h);
+
+                    % Cooling region
+                    elseif T_curr > ...
+                            (data_in.Tset + data_in.T_tol)
+
+                        dT = ...
+                            T_curr ...
+                            - (data_in.Tset + data_in.T_tol);
+
+                        P_act = min( ...
+                            data_in.alpha_c * (dT^2) ...
+                            + data_in.base_kW, ...
+                            data_in.P_max_c);
+
+                    % Comfort region
+                    else
+                        P_act = data_in.base_kW;
+                    end
+
+                    E_hvac = ...
+                        P_act * data_in.tij(i,j);
+
+                    E_dynamic(i,j,k) = ...
+                        data_in.E0(i,j) + E_hvac;
+                end
+            end
+        end
+    end
+
+    data_out.E_dynamic = E_dynamic;
+    data_out.E = mean(E_dynamic, 3);
 end
 % ==============================================================================
 % HELPER: PLOT THERMAL CURVE (Time vs Segment Temperature)
