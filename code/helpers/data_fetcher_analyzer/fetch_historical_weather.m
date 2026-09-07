@@ -54,7 +54,7 @@ end
 fprintf('Koordinatlar başarıyla yüklendi.\n');
 
 % --- 2. HAVA DURUMU API (GEÇMİŞ VERİ - 15 TEMMUZ 2024) ---
-target_date = '2024-01-15'; 
+target_date = '2024-07-15'; 
 fprintf('--- Veri Çekme İşlemi Başlıyor: %s ---\n', target_date);
 
 % Sonuç Matrisi (15 Node x 24 Saat)
@@ -92,7 +92,7 @@ T = array2table(weather_matrix);
 T.Properties.RowNames = node_names;
 T.Properties.VariableNames = "Hour_" + (0:23);
 
-output_filename = 'Fixed_Weather_Data_15January.xlsx';
+output_filename = 'Fixed_Weather_Data_15July.xlsx';
 writetable(T, output_filename, 'WriteRowNames', true);
 
 fprintf('\n>>> İŞLEM TAMAMLANDI. Dosya kaydedildi: %s <<<\n', output_filename);
